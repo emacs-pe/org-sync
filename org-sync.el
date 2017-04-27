@@ -310,7 +310,7 @@ WITH-HM and INACTIVE are passed to `org-sync-format-time'."
   "Generate an alist from OBJECT slots."
   (cl-loop for slot in (org-sync-object-slots object)
            unless (eq slot 'description) ; XXX: description is stored separately
-           collect (cons (org-sync-property-prefix slot) (org-sync-serialize (eieio-oref object slot)))))
+           collect (cons (org-sync-property-prefix slot) (eieio-oref object slot))))
 
 (defun org-sync-document-keywords ()
   "Return an alist of org document keywords."
