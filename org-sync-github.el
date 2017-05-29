@@ -6,7 +6,7 @@
 ;; URL:
 ;; Keywords: convenience
 ;; Version: 0.1
-;; Package-Requires: ((emacs "25.1") (pkg-info "0.6") (request "0.2.0"))
+;; Package-Requires: ((emacs "25.1"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -29,15 +29,13 @@
 
 ;;; Code:
 (eval-when-compile
-  (require 'cl-lib))
+  (require 'cl-lib)
+  (require 'subr-x))
 
 (require 'eieio)
-(require 'subr-x)
-(require 'request)
 (require 'org-sync)
 (require 'magit-git)
-
-(declare-function pkg-info-version-info "pkg-info" (library))
+(require 'url-expand)
 
 ;;; Customize
 (defgroup org-sync-github nil
@@ -59,8 +57,8 @@
   :group 'org-sync-github)
 
 (defcustom org-sync-github-issues-params
-  '(("per_page" . "100") ; XXX: max allowed https://developer.github.com/v3/#pagination
-    ("state"    . "all"))
+  '(("per_page" "100") ; XXX: max allowed https://developer.github.com/v3/#pagination
+    ("state" "all"))
   "Default params to call GitHub API to fetch all issues."
   :type 'list
   :safe #'listp
@@ -119,25 +117,6 @@
                 (format "/repos/%s/issues" slug)
               (user-error "Could not guess repository from remote")))))))
 
-(cl-defun org-sync-github-request (endpoint
-                                   &key
-                                   (type "GET")
-                                   (data nil)
-                                   (sync nil)
-                                   (params nil)
-                                   (parser 'org-sync-json-read)
-                                   )
-  "Request to GitHub api ENDPOINT."
-  (request (url-expand-file-name endpoint org-sync-github-api-baseurl)
-           :type type
-           :data data
-           :sync sync
-           :params params
-           :headers (org-sync-github-request-headers)
-           :error (lambda (&rest _)          ; TODO: Add proper error handling
-                    (message "Something bad happened..."))
-           :parser parser))
-
 (defun org-sync-github-issue (data)
   "Given a DATA response from GitHub issue api return an `org-sync-issue'."
   (let-alist data
@@ -165,11 +144,12 @@
 
 (cl-defmethod org-sync/issues ((_backend (eql github)))
   "Get issues from GitHub backend."
-  (let ((response (org-sync-github-request (org-sync-github-read-endpoint) :params org-sync-github-issues-params :sync t)))
-    (if-let (err (request-response-error-thrown response))
-        (signal (car err) (cdr err))
-      (sit-for .5)                      ; FIXME: wait for response be parsed
-      (mapcar #'org-sync-github-issue (request-response-data response)))))
+  (let ((url (url-expand-file-name (org-sync-github-read-endpoint) org-sync-github-api-baseurl))
+        (url-request-extra-headers (org-sync-github-request-headers)))
+    (thread-last (concat url (if (string-match-p "\\?" url) "&" "?") (url-build-query-string org-sync-github-issues-params))
+      url-retrieve-synchronously
+      org-sync-retrieve-parse-json
+      (mapcar #'org-sync-github-issue))))
 
 ;;;###autoload
 (with-eval-after-load 'org-sync

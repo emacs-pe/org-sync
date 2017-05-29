@@ -6,7 +6,7 @@
 ;; URL:
 ;; Keywords: convenience
 ;; Version: 0.1
-;; Package-Requires: ((emacs "25.1") (request "0.2.0"))
+;; Package-Requires: ((emacs "25.1"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -34,13 +34,13 @@
 
 ;;; Code:
 (eval-when-compile
-  (require 'cl-lib))
+  (require 'cl-lib)
+  (require 'subr-x))
 
 (require 'eieio)
-(require 'subr-x)
-(require 'request)
 (require 'org-sync)
 (require 'magit-git)
+(require 'url-expand)
 
 ;;; Customize
 (defgroup org-sync-gitlab nil
@@ -56,8 +56,8 @@
   :group 'org-sync-gitlab)
 
 (defcustom org-sync-gitlab-issues-params
-  '(("per_page" . "100") ; XXX: max allowed https://docs.gitlab.com/ce/api/#pagination
-    ("order_by" . "updated_at")         ; better than the default "created_at"
+  '(("per_page" "100") ; XXX: max allowed https://docs.gitlab.com/ce/api/#pagination
+    ("order_by" "updated_at")           ; better than the default "created_at"
     )
   "Default params to call the Gitlab API."
   :type 'list
@@ -121,37 +121,6 @@ See: `https://gitlab.com/profile/personal_access_tokens'"
           (oauth-token   `("Authorization" . ,(format "Bearer %s" (org-sync-gitlab-token))))
           (private-token `("Private-Token" . ,(org-sync-gitlab-private-token))))
         org-sync-gitlab-default-headers))
-
-(cl-defun org-sync-gitlab-request-log-callback (&key data response error-thrown &allow-other-keys)
-  "Callback to log the last request to travis-ci api."
-  (and error-thrown (message (error-message-string error-thrown)))
-  (and org-sync-gitlab-log
-       (with-current-buffer (get-buffer-create org-sync-gitlab-log-buffer)
-         (erase-buffer)
-         (insert (propertize "DATA:\n" 'face font-lock-constant-face))
-         (insert (format "%S\n\n" data))
-         (insert (propertize "ERROR:\n" 'face font-lock-constant-face))
-         (insert (format "%S\n\n" error-thrown))
-         (insert (propertize "HEADERS:\n" 'face font-lock-constant-face))
-         (insert (format "%S" (request-response--raw-header response))))))
-
-(cl-defun org-sync-gitlab-request (endpoint
-                                   &key
-                                   (type "GET")
-                                   (data nil)
-                                   (sync nil)
-                                   (params nil)
-                                   (parser 'org-sync-json-read)
-                                   )
-  "Request to Gitlab api ENDPOINT."
-  (request (url-expand-file-name endpoint org-sync-gitlab-api-baseurl)
-           :type type
-           :data data
-           :sync sync
-           :params params
-           :headers (org-sync-gitlab-request-headers)
-           :complete 'org-sync-gitlab-request-log-callback
-           :parser parser))
 
 (defun org-sync-gitlab-read-endpoint ()
   "Read an endpoint to be used to fetch the issues."
@@ -218,29 +187,29 @@ See: `https://gitlab.com/profile/personal_access_tokens'"
 (cl-defmethod org-sync/metadata ((_backend (eql gitlab)))
   `(("OS_GITLAB_APIURL"     . ,(or (org-entry-get nil "OS_GITLAB_APIURL")
                                    org-sync-gitlab-api-baseurl))
-    ("OS_GITLAB_PROJECT_ID" . ,(or (org-entry-get nil "OS_GITLAB_PROJECT_ID" t)
+    ("OS_GITLAB_PROJECT_ID" . ,(or (org-entry-get nil "OS_GITLAB_PROJECT_ID" 'inherit)
                                    (user-error "Incorrectly configured")))))
 
 (cl-defmethod org-sync/issue-new ((_backend (eql gitlab)) metadata issue-data)
-  (let* ((object `((title       . ,(plist-get issue-data :title))
-                   (labels      . ,(string-join (plist-get issue-data :tags) ","))
-                   (description . ,(plist-get issue-data :description))))
-         (response (org-sync-gitlab-request (format "projects/%s/issues" (org-sync-assoc-default "OS_GITLAB_PROJECT_ID" metadata))
-                                            :type "POST"
-                                            :data (org-sync-json-encode object)
-                                            :sync t)))
-    (if-let (err (request-response-error-thrown response))
-        (signal (car err) (cdr err))
-      (sit-for .5)                      ; FIXME: wait for response be parsed
-      (org-sync-gitlab-issue (request-response-data response)))))
+  (let ((url (url-expand-file-name (format "projects/%s/issues" (org-sync-assoc-default "OS_GITLAB_PROJECT_ID" metadata)) org-sync-gitlab-api-baseurl))
+        (url-request-method "POST")
+        (url-request-data (org-sync-json-encode `((title       . ,(plist-get issue-data :title))
+                                                  (labels      . ,(string-join (plist-get issue-data :tags) ","))
+                                                  (description . ,(plist-get issue-data :description)))))
+        (url-request-extra-headers (org-sync-gitlab-request-headers)))
+    (thread-last url
+      url-retrieve-synchronously
+      org-sync-retrieve-parse-json
+      org-sync-gitlab-issue)))
 
 (cl-defmethod org-sync/issues ((_backend (eql gitlab)))
   "Get issues from Gitlab backend with params with CONTEXT."
-  (let ((response (org-sync-gitlab-request (org-sync-gitlab-read-endpoint) :params org-sync-gitlab-issues-params :sync t)))
-    (if-let (err (request-response-error-thrown response))
-        (signal (car err) (cdr err))
-      (sit-for .5)                      ; FIXME: wait for response be parsed
-      (mapcar #'org-sync-gitlab-issue (request-response-data response)))))
+  (let ((url (url-expand-file-name (org-sync-gitlab-read-endpoint) org-sync-gitlab-api-baseurl))
+        (url-request-extra-headers (org-sync-gitlab-request-headers)))
+    (thread-last (concat url (if (string-match-p "\\?" url) "&" "?") (url-build-query-string org-sync-gitlab-issues-params))
+      url-retrieve-synchronously
+      org-sync-retrieve-parse-json
+      (mapcar #'org-sync-gitlab-issue))))
 
 ;;;###autoload
 (with-eval-after-load 'org-sync

@@ -30,7 +30,8 @@
 ;;; Code:
 (eval-when-compile
   (require 'cl-lib)
-  (require 'subr-x))
+  (require 'subr-x)
+  (defvar url-http-end-of-headers))
 
 (require 'ob)
 (require 'org)
@@ -226,6 +227,28 @@ Return the position where this entry starts, or nil if there is no such entry."
   (let ((json-array-type 'list))
     (json-read-from-string (decode-coding-string (buffer-substring-no-properties (point) (point-max)) (or coding-system 'utf-8)))))
 
+(defun org-sync-retrieve-parse-xml (buffer)
+  "Return the parsed xml from a `url-retrieve' BUFFER response body."
+  (with-current-buffer buffer
+    (goto-char (1+ url-http-end-of-headers))
+    (libxml-parse-xml-region (point) (point-max))))
+
+(defun org-sync-retrieve-parse-html (buffer)
+  "Return the parsed html from a `url-retrieve' BUFFER response body."
+  (with-current-buffer buffer
+    (goto-char (1+ url-http-end-of-headers))
+    (libxml-parse-html-region (point) (point-max))))
+
+(defun org-sync-retrieve-parse-json (buffer)
+  "Return a parsed json from a `url-retrieve' BUFFER response body."
+  (with-current-buffer buffer
+    (goto-char (1+ url-http-end-of-headers))
+    (org-sync-parse-json-region (point) (point-max))))
+
+(defun org-sync-parse-json-region (start end &optional coding-system)
+  "Call `json-read-from-string' from START to END points with CODING-SYSTEM."
+  (json-read-from-string (decode-coding-string (buffer-substring start end) (or coding-system 'utf-8))))
+
 (defun org-sync-json-encode (object &optional coding-system)
   "Return a JSON representation of OBJECT as a string with CODING-SYSTEM."
   (encode-coding-string (json-encode object) (or coding-system 'utf-8)))
@@ -234,7 +257,8 @@ Return the position where this entry starts, or nil if there is no such entry."
   "Parse DATE-STRING and return a time value."
   (condition-case nil
       (parse-iso8601-time-string date-string)
-    (error (apply 'encode-time (org-parse-time-string date-string))))) ;; XXX: Don't use `date-to-time' because is buggy
+    ;; XXX: Don't use `date-to-time' because is buggy
+    (error (apply 'encode-time (org-parse-time-string date-string)))))
 
 (defsubst org-sync-parse-date-maybe (date-string)
   "Return a internal time for DATE-STRING if is not nil."

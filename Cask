@@ -8,7 +8,6 @@
        "org-sync-github.el"
        "org-sync-gitlab.el")
 
-(depends-on "request")
 ;; XXX: To force cask to use org archive https://github.com/cask/cask/issues/169
 (depends-on "org-plus-contrib")
 
