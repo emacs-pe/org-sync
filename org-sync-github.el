@@ -6,7 +6,7 @@
 ;; URL:
 ;; Keywords: convenience
 ;; Version: 0.1
-;; Package-Requires: ((emacs "25.1"))
+;; Package-Requires: ((emacs "25.1") (ghub "1.2"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -27,15 +27,17 @@
 
 ;;; Commentary:
 
+;; Synchronize GitHub issues.
+
 ;;; Code:
 (eval-when-compile
   (require 'cl-lib)
   (require 'subr-x))
 
+(require 'ghub)
 (require 'eieio)
 (require 'org-sync)
 (require 'magit-git)
-(require 'url-expand)
 
 ;;; Customize
 (defgroup org-sync-github nil
@@ -43,79 +45,40 @@
   :prefix "org-sync-"
   :group 'org-sync)
 
-(defcustom org-sync-github-api-baseurl "https://api.github.com"
-  "Base url for Github API."
-  :type 'string
-  :safe #'stringp
-  :group 'org-sync-github)
-
-(defcustom org-sync-github-api-auth-method nil
-  "Default authentication method used to make request to GitHub API."
-  :type '(choice (string :tag "Oauth token"     oauth-token)
-                 (const  :tag "Unauthenticated" nil))
-  :safe #'symbolp
-  :group 'org-sync-github)
-
 (defcustom org-sync-github-issues-params
-  '(("per_page" "100") ; XXX: max allowed https://developer.github.com/v3/#pagination
-    ("state" "all"))
+  '((state    . "all")
+    (per_page . "100") ; XXX: max allowed https://developer.github.com/v3/#pagination
+    )
   "Default params to call GitHub API to fetch all issues."
   :type 'list
   :safe #'listp
   :group 'org-sync-github)
 
-(defcustom org-sync-github-token nil
-  "Default access token to call the GitHub API."
-  :type 'string
-  :safe #'stringp
+(defcustom org-sync-github-unpaginate nil
+  "Whether to use an un-paginated call when fetching issues."
+  :type 'boolean
+  :safe 'booleanp
   :group 'org-sync-github)
 
-(defvar org-sync-github-default-headers
-  ;; XXX: https://developer.github.com/changes/2016-05-12-reactions-api-preview/
-  `(("Accept"     . "application/vnd.github.squirrel-girl-preview")
-    ("User-Agent" . ,(format "org-sync.el/%s" org-sync-version))))
-
-
 (defclass org-sync-issue-github (org-sync-issue)
   ((locked     :initarg :locked     :initform nil)
    (assignees  :initarg :assignees  :initform nil)))
 
-(defun org-sync-github-token ()
-  "Get github token."
-  (or org-sync-github-token
-      (getenv "GITHUB_TOKEN")           ; used by "hub"
-      (magit-get "github" "oauth-token")
-      (user-error "You need to generate a personal access token.  https://github.com/settings/tokens")))
-
-(defun org-sync-github-request-headers ()
-  "Return an alist with http headers used to call the GitHub api."
-  (cons (cl-case org-sync-github-api-auth-method
-          (oauth-token   `("Authorization" . ,(format "Bearer %s" (org-sync-github-token)))))
-        org-sync-github-default-headers))
-
 (defun org-sync-github-read-endpoint ()
   "Read an endpoint to be used to fetch the issues."
-  (cl-multiple-value-bind (context name)
-      (org-sync-read-multiple-choice "Issues by?"
+  (cl-multiple-value-bind (context _name)
+      (org-sync-read-multiple-choice "GitHub Issues by?"
                                      '((?u "user issues")
                                        (?o "organization issues")
                                        (?e "enter project")
                                        (?r "git remote")))
-    (message "Reading GitHub endpoint by %s" name)
     (cl-ecase context
       (?u "/issues")
-      (?o (let ((organization (read-string "Organization: ")))
-            (cl-assert (not (string-blank-p organization)) nil "Organization must not be an empty string")
-            (format "/orgs/%s/issues" organization)))
-      (?e (let ((project (read-string "Project (owner/repo): ")))
-            (cl-assert (not (string-blank-p project)) nil "Project must not be an empty string")
-            (format "/repos/%s/issues" project)))
-      (?r (cl-multiple-value-bind (host slug)
-              (org-sync-parse-remote-or-error (magit-get "remote" (magit-read-remote "Remote") "url"))
-            (or (string= host "github.com") (lwarn 'org-sync :warning (format "Repository \"%s\" at \"%s\" host might not be a GitHub repository" slug host)))
-            (if (y-or-n-p (format "Detected repository as \"%s\", is this correct? " slug))
-                (format "/repos/%s/issues" slug)
-              (user-error "Could not guess repository from remote")))))))
+      (?o (format "/orgs/%s/issues" (magit-read-string-ns "Organization")))
+      (?e (format "/repos/%s/issues" (magit-read-string-ns "Project (owner/repo)")))
+      (?r (cl-multiple-value-bind (_host slug)
+              (org-sync-parse-remote (magit-read-string-ns "Remote Url" (magit-get "remote" (magit-read-remote "Remote" nil t) "url")))
+            (format "/repos/%s/issues" slug))))))
 
 (defun org-sync-github-issue (data)
   "Given a DATA response from GitHub issue api return an `org-sync-issue'."
@@ -124,7 +87,9 @@
                    ;; NOTE: Don't use .id, because is global
                    :id          .number
                    :url         .html_url
-                   :tags        (org-sync-assoc-list "name" .labels)
+                   :tags        (mapcar (lambda (label)
+                                          (assoc-default "name" label))
+                                        .labels)
                    :title       .title
                    :status      (pcase .state
                                   ("open"   'todo)
@@ -134,7 +99,9 @@
                    :comments    .comments
                    :locked      (org-sync-json-truthy .locked)
                    :milestone   .milestone.number
-                   :assignees   (org-sync-assoc-list "login" .assignees)
+                   :assignees   (mapcar (lambda (assignee)
+                                          (assoc-default "login" assignee))
+                                        .assignees)
                    :closed-at   .closed_at
                    :closed-by   .closed_by.login
                    :created-at  .created_at
@@ -144,12 +111,11 @@
 
 (cl-defmethod org-sync/issues ((_backend (eql github)))
   "Get issues from GitHub backend."
-  (let ((url (url-expand-file-name (org-sync-github-read-endpoint) org-sync-github-api-baseurl))
-        (url-request-extra-headers (org-sync-github-request-headers)))
-    (thread-last (concat url (if (string-match-p "\\?" url) "&" "?") (url-build-query-string org-sync-github-issues-params))
-      url-retrieve-synchronously
-      org-sync-retrieve-parse-json
-      (mapcar #'org-sync-github-issue))))
+  (let ((endpoint (or (org-sync-document-keyword "ORG_SYNC_ISSUES")
+                      (org-sync-returning-it (org-sync-github-read-endpoint)
+                        (org-sync-document-keyword-insert "ORG_SYNC_ISSUES" it))))
+        (ghub-unpaginate org-sync-github-unpaginate))
+    (mapcar #'org-sync-github-issue (ghub-get endpoint org-sync-github-issues-params))))
 
 ;;;###autoload
 (with-eval-after-load 'org-sync

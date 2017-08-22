@@ -9,6 +9,7 @@
        "org-sync-gitlab.el")
 
 (depends-on "glab")
+(depends-on "ghub")
 ;; XXX: To force cask to use org archive https://github.com/cask/cask/issues/169
 (depends-on "org-plus-contrib")
 
