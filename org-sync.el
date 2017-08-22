@@ -97,15 +97,9 @@ The following format codes are supported:
   :group 'org-sync)
 
 (defcustom org-sync-process-commented-entries nil
-  "Default filename used by `org-sync' to fetch issues."
+  "Whether to sync commented org entries."
   :type 'boolean
   :safe #'booleanp
-  :group 'org-sync)
-
-(defcustom org-sync-file-name "orgsync.org"
-  "Default filename used by `org-sync' to fetch issues."
-  :type 'string
-  :safe #'stringp
   :group 'org-sync)
 
 (defcustom org-sync-export-backend 'md
@@ -130,12 +124,6 @@ This directory is relative to git dir.")
 (put 'org-sync 'permanent-local t)
 ;;;###autoload
 (put 'org-sync 'safe-local-variable 'booleanp)
-
-(defvar-local org-sync-backend nil
-  "Default `org-sync' backend used in current buffer.")
-(put 'org-sync-backend 'permanent-local t)
-;;;###autoload
-(put 'org-sync-backend 'safe-local-variable 'org-sync-registered-backend-p)
 
 (defconst org-sync-version "0.1"
   "Org-sync version.")
@@ -177,12 +165,19 @@ This directory is relative to git dir.")
   "Determine whether `org-sync' BACKEND is registered."
   (memq backend org-sync-backends))
 
+(defmacro org-sync-returning-it (value &rest body)
+  "Anaphoric form which evaluate and return VALUE and BODY."
+  (declare (debug ((&rest (sexp form)) body))
+           (indent 1))
+  `(when-let (it ,value) (prog1 it ,@body)))
+
 (defun org-sync-backend ()
   "Select an appropriate backend."
-  (or org-sync-backend
-      (and (derived-mode-p 'org-mode)
-           (or (org-entry-get nil "OS_BACKEND" 'inherit)
-               (org-sync-document-keyword "OS_BACKEND")))))
+  (cl-assert (derived-mode-p 'org-mode) nil "This is not an Org mode buffer: %s" major-mode)
+  (org-sync-as-symbol
+   (or (org-sync-document-keyword "ORG_SYNC_BACKEND")
+       (org-sync-returning-it (completing-read "Backend: " org-sync-backends nil t)
+         (org-sync-document-keyword-insert "ORG_SYNC_BACKEND" it)))))
 
 (defun org-sync-clean-tag (tag)
   "Clean TAG with valid characters."
@@ -335,6 +330,15 @@ WITH-HM and INACTIVE are passed to `org-sync-format-time'."
   (cl-loop for slot in (org-sync-object-slots object)
            unless (eq slot 'description) ; XXX: description is stored separately
            collect (cons (org-sync-property-prefix slot) (eieio-oref object slot))))
+
+(defun org-sync-document-keyword-insert (keyword value)
+  "Insert document KEYWORD with VALUE in the current file."
+  (org-with-wide-buffer
+   (goto-char (point-min))
+   (while (re-search-forward "^[ \t]*#\\+\\([^\t\n]+\\):[ \t]*\\([^\t\n]+\\)" nil t))
+   (unless (= (point) (point-min))
+     (insert "\n"))
+   (insert (format "#+%s: %s\n" keyword value))))
 
 (defun org-sync-document-keywords ()
   "Return an alist of org document keywords."
@@ -511,7 +515,6 @@ by `org-sync-metadata-prefix'."
 With \\[universal-argument] prefix ARG, use completion to
 determine the new state."
   (interactive "P")
-  (cl-assert (derived-mode-p 'org-mode) nil "Cannot execute `%s' in not an Org mode: %s" this-command major-mode)
   (if (and (org-region-active-p) org-loop-over-headlines-in-active-region)
       (let ((cl (if (eq org-loop-over-headlines-in-active-region 'start-level)
                     'region-start-level 'region))
@@ -546,24 +549,18 @@ determine the new state."
                 (insert (org-sync/issue->org issue))))))))))
 
 ;;;###autoload
-(cl-defun org-sync-issues (&optional (backend (org-sync-backend)))
-  "Show issues from BACKEND."
-  (interactive (list (or (and (not current-prefix-arg) (org-sync-backend))
-                         (completing-read "Backend: " org-sync-backends nil t nil nil (org-sync-backend)))))
-  (setq backend (org-sync-as-symbol backend))
-  (cl-assert (org-sync-registered-backend-p backend) nil "Unregistered org-sync backend: %S" backend)
-  (with-current-buffer (find-file-noselect org-sync-file-name)
-    (dolist (issue (org-sync/issues backend))
-      (if-let (pom (org-sync-find-entry-with-id (oref issue id)))
-          (with-demoted-errors "Error while syncing issue: %S"
-            (org-with-point-at pom
-              (message "Syncing issue %s..." (oref issue id))
-              (call-interactively #'org-sync)))
-        (org-with-point-at (point-max)
-          (insert (org-sync/issue->org issue)))))
-    (org-mode)
-    (run-hooks 'org-sync-issues-hook)
-    (pop-to-buffer (current-buffer) nil t)))
+(cl-defun org-sync-issues ()
+  "Show issues from backend."
+  (interactive)
+  (dolist (issue (org-sync/issues (org-sync-backend)))
+    (if-let (pom (org-sync-find-entry-with-id (oref issue id)))
+        (with-demoted-errors "Error while syncing issue: %S"
+          (org-with-point-at pom
+            (message "Syncing issue %s..." (oref issue id))
+            (call-interactively #'org-sync)))
+      (org-with-point-at (point-max)
+        (insert (org-sync/issue->org issue)))))
+  (run-hooks 'org-sync-issues-hook))
 
 (provide 'org-sync)
 ;;; org-sync.el ends here
