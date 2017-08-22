@@ -259,18 +259,6 @@ Return the position where this entry starts, or nil if there is no such entry."
   "Return a internal time for DATE-STRING if is not nil."
   (and date-string (org-sync-parse-date date-string)))
 
-(defun org-sync-random-color ()
-  "Return a random hex triplet color."
-  (format "%02x%02x%02x" (random 256) (random 256) (random 256)))
-
-(defun org-sync-assoc-default (key alist)
-  "Get value associate with KEY from ALIST."
-  (cdr-safe (assoc-string key alist)))
-
-(defun org-sync-assoc-list (key list-of-alists)
-  "Return a list with the values of KEY associated in each alist of LIST-OF-ALISTS."
-  (mapcar (lambda (alist) (org-sync-assoc-default key alist)) list-of-alists))
-
 (defun org-sync-git-parse-url (url)
   "Parse an git remote URL, and return an url struct."
   (url-generic-parse-url (if (and (not (string-match-p "^[a-zA-Z_-]+://" url))
