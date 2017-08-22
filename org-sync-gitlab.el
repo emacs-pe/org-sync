@@ -6,7 +6,7 @@
 ;; URL:
 ;; Keywords: convenience
 ;; Version: 0.1
-;; Package-Requires: ((emacs "25.1"))
+;; Package-Requires: ((emacs "25.1") (glab "1.1"))
 
 ;; This file is NOT part of GNU Emacs.
 
@@ -37,123 +37,53 @@
   (require 'cl-lib)
   (require 'subr-x))
 
+(require 'glab)
 (require 'eieio)
 (require 'org-sync)
 (require 'magit-git)
-(require 'url-expand)
-
-;;; Customize
+
 (defgroup org-sync-gitlab nil
   "Syncronice org with gitlab issues."
   :prefix "org-sync-"
   :group 'org-sync)
 
-(defcustom org-sync-gitlab-api-baseurl (or (getenv "GITLAB_API_ENDPOINT")
-                                           "https://gitlab.com/api/v3/")
-  "Base url for Gitlab API."
-  :type 'string
-  :safe 'stringp
-  :group 'org-sync-gitlab)
-
 (defcustom org-sync-gitlab-issues-params
-  '(("per_page" "100") ; XXX: max allowed https://docs.gitlab.com/ce/api/#pagination
-    ("order_by" "updated_at")           ; better than the default "created_at"
+  '((per_page . "100") ; XXX: max allowed https://docs.gitlab.com/ce/api/#pagination
     )
-  "Default params to call the Gitlab API."
+  "Default params to call the Gitlab API when fetching the issues."
   :type 'list
   :safe 'listp
   :group 'org-sync-gitlab)
 
-(defcustom org-sync-gitlab-api-auth-method nil
-  "Default authentication method used to make request to Gitlab api."
-  :type '(choice (string :tag "Oauth token"     oauth-token)
-                 (const  :tag "Private token"   private-token)
-                 (const  :tag "Unauthenticated" nil))
-  :safe 'symbolp
-  :group 'org-sync-gitlab)
-
-(defcustom org-sync-gitlab-token nil
-  "Default access token to call the Gitlab API.
-
-See: `https://docs.gitlab.com/ce/api/oauth2.html'"
-  :type 'string
-  :safe 'stringp
-  :group 'org-sync-gitlab)
-
-(defcustom org-sync-gitlab-log nil
-  "Whether to save the log the last request to gitlab API."
+(defcustom org-sync-gitlab-unpaginate nil
+  "Whether to use an un-paginated call when fetching issues."
   :type 'boolean
   :safe 'booleanp
   :group 'org-sync-gitlab)
 
-(defcustom org-sync-gitlab-private-token nil
-  "User private token.
-
-See: `https://gitlab.com/profile/personal_access_tokens'"
-  :type 'string
-  :safe 'stringp
-  :group 'org-sync-gitlab)
-
-(defvar org-sync-gitlab-default-headers
-  `(("Content-Type" . "application/json")
-    ("User-Agent"   . ,(format "org-sync.el/%s" org-sync-version))))
-
-(defvar org-sync-gitlab-log-buffer "*org-sync-log[gitlab]*")
-
-
-(defun org-sync-gitlab-token ()
-  "Get user gitlab access token."
-  (or org-sync-gitlab-token
-      (getenv "GITLAB_TOKEN")
-      (magit-get "gitlab" "oauth-token")
-      (user-error "You need to generate a gitlab oauth token")))
-
-(defun org-sync-gitlab-private-token ()
-  "Get user private token."
-  (or org-sync-gitlab-private-token
-      (getenv "GITLAB_API_PRIVATE_TOKEN") ; used by Gitlab ruby client
-      (magit-get "gitlab" "private-token")
-      (user-error "You need to generate a gitlab private token.  https://gitlab.com/profile/personal_access_tokens")))
-
-(defun org-sync-gitlab-request-headers ()
-  "Return an alist with http headers used to call the Gitlab api."
-  (cons (cl-case org-sync-gitlab-api-auth-method
-          (oauth-token   `("Authorization" . ,(format "Bearer %s" (org-sync-gitlab-token))))
-          (private-token `("Private-Token" . ,(org-sync-gitlab-private-token))))
-        org-sync-gitlab-default-headers))
-
-(defun org-sync-gitlab-read-endpoint ()
-  "Read an endpoint to be used to fetch the issues."
-  (cl-multiple-value-bind (context name)
-      (org-sync-read-multiple-choice "Issues by?"
-                                     '((?u "user issues")
-                                       (?g "group issues")
-                                       (?e "enter project")
-                                       (?r "git remote")))
-    (message "Reading Gitlab endpoint by %s" name)
-    (cl-ecase context
-      (?u "issues")
-      (?g (let ((group-id (read-string "Group ID: ")))
-            (cl-assert (not (string-blank-p group-id)) nil "Organization must not be an empty string")
-            (format "groups/%s/issues" group-id)))
-      (?e (let ((project (read-string "Project (owner/repo): ")))
-            (cl-assert (not (string-blank-p project)) nil "Organization must not be an empty string")
-            (format "projects/%s/issues" (url-hexify-string project))))
-      (?r (cl-multiple-value-bind (host slug)
-              (org-sync-parse-remote-or-error (magit-get "remote" (magit-read-remote "Remote") "url"))
-            (or (string= host "gitlab.com") (lwarn 'org-sync :warning (format "Repository \"%s\" at \"%s\" host might not be a Gitlab repository" slug host)))
-            ;; XXX: url encode "user/repo" to avoid to know first hand the project_id.
-            ;;      See: https://docs.gitlab.com/ee/api/projects.html#get-single-project
-            (if (y-or-n-p (format "Detected repository as \"%s\", is this correct? " slug))
-                (format "projects/%s/issues" (url-hexify-string slug))
-              (user-error "Could not guess repository from remote")))))))
-
 (defclass org-sync-issue-gitlab (org-sync-issue)
   ((assignee      :initarg :assignee      :initform nil)
    (subscribed    :initarg :subscribed    :initform nil)
    (confidential  :initarg :confidential  :initform nil)))
 
-
+;; NB: URL encode "user/repo" to avoid to know first hand the project_id.
+;;     https://docs.gitlab.com/ee/api/projects.html#get-single-project
+(defun org-sync-gitlab-read-endpoint ()
+  "Read an endpoint to be used to fetch the issues."
+  (cl-multiple-value-bind (context _name)
+      (org-sync-read-multiple-choice "GitLab issues by?"
+                                     '((?u "user issues")
+                                       (?g "group issues")
+                                       (?e "enter project")
+                                       (?r "git remote")))
+    (cl-ecase context
+      (?u "/issues")
+      (?g (format "/groups/%s/issues" (magit-read-string-ns "Group ID")))
+      (?e (format "/projects/%s/issues" (url-hexify-string (magit-read-string-ns "Project (owner/repo)"))))
+      (?r (cl-multiple-value-bind (_host slug)
+              (org-sync-parse-remote (magit-read-string-ns "Remote Url" (magit-get "remote" (magit-read-remote "Remote" nil t) "url")))
+            (format "/projects/%s/issues" (url-hexify-string slug)))))))
+
 (defun org-sync-gitlab-issue (data)
   "Given a DATA response from Gitlab issue api return an `org-sync-issue'."
   (let-alist data
@@ -181,35 +111,18 @@ See: `https://gitlab.com/profile/personal_access_tokens'"
                    :subscribed   (org-sync-json-truthy .subscribed)
                    :confidential (org-sync-json-truthy .confidential))))
 
-(cl-defmethod org-sync/valid-p ((_backend (eql gitlab)) metadata)
-  (org-sync-assoc-default "OS_GITLAB_ENDPOINT" metadata))
-
-(cl-defmethod org-sync/metadata ((_backend (eql gitlab)))
-  `(("OS_GITLAB_APIURL"     . ,(or (org-entry-get nil "OS_GITLAB_APIURL")
-                                   org-sync-gitlab-api-baseurl))
-    ("OS_GITLAB_PROJECT_ID" . ,(or (org-entry-get nil "OS_GITLAB_PROJECT_ID" 'inherit)
-                                   (user-error "Incorrectly configured")))))
-
-(cl-defmethod org-sync/issue-new ((_backend (eql gitlab)) metadata issue-data)
-  (let ((url (url-expand-file-name (format "projects/%s/issues" (org-sync-assoc-default "OS_GITLAB_PROJECT_ID" metadata)) org-sync-gitlab-api-baseurl))
-        (url-request-method "POST")
-        (url-request-data (org-sync-json-encode `((title       . ,(plist-get issue-data :title))
-                                                  (labels      . ,(string-join (plist-get issue-data :tags) ","))
-                                                  (description . ,(plist-get issue-data :description)))))
-        (url-request-extra-headers (org-sync-gitlab-request-headers)))
-    (thread-last url
-      url-retrieve-synchronously
-      org-sync-retrieve-parse-json
-      org-sync-gitlab-issue)))
+(cl-defmethod org-sync/issue-new ((_backend (eql gitlab)) data)
+  (let ((endpoint (org-sync-document-keyword "ORG_SYNC_ISSUES")))
+    (org-sync-gitlab-issue (glab-post endpoint nil `((title       . ,(plist-get data :title))
+                                                     (labels      . ,(string-join (plist-get data :tags) ","))
+                                                     (description . ,(plist-get data :description)))))))
 
 (cl-defmethod org-sync/issues ((_backend (eql gitlab)))
-  "Get issues from Gitlab backend with params with CONTEXT."
-  (let ((url (url-expand-file-name (org-sync-gitlab-read-endpoint) org-sync-gitlab-api-baseurl))
-        (url-request-extra-headers (org-sync-gitlab-request-headers)))
-    (thread-last (concat url (if (string-match-p "\\?" url) "&" "?") (url-build-query-string org-sync-gitlab-issues-params))
-      url-retrieve-synchronously
-      org-sync-retrieve-parse-json
-      (mapcar #'org-sync-gitlab-issue))))
+  (let ((endpoint (or (org-sync-document-keyword "ORG_SYNC_ISSUES")
+                      (org-sync-returning-it (org-sync-gitlab-read-endpoint)
+                        (org-sync-document-keyword-insert "ORG_SYNC_ISSUES" it))))
+        (glab-unpaginate org-sync-gitlab-unpaginate))
+    (mapcar #'org-sync-gitlab-issue (glab-get endpoint org-sync-gitlab-issues-params))))
 
 ;;;###autoload
 (with-eval-after-load 'org-sync
