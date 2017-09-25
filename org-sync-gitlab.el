@@ -3,7 +3,7 @@
 ;; Copyright (c) 2015 Mario Rodas <marsam@users.noreply.github.com>
 
 ;; Author: Mario Rodas <marsam@users.noreply.github.com>
-;; URL:
+;; URL: https://github.com/emacs-pe/org-sync
 ;; Keywords: convenience
 ;; Version: 0.1
 ;; Package-Requires: ((emacs "25.1") (glab "1.1"))
@@ -68,21 +68,21 @@
 
 ;; NB: URL encode "user/repo" to avoid to know first hand the project_id.
 ;;     https://docs.gitlab.com/ee/api/projects.html#get-single-project
-(defun org-sync-gitlab-read-endpoint ()
-  "Read an endpoint to be used to fetch the issues."
+(defun org-sync-gitlab-endpoint-project ()
+  "Read a GitLab project id to be used by this backend."
   (cl-multiple-value-bind (context _name)
-      (org-sync-read-multiple-choice "GitLab issues by?"
-                                     '((?u "user issues")
-                                       (?g "group issues")
-                                       (?e "enter project")
-                                       (?r "git remote")))
+      (org-sync-read-multiple-choice "GitLab project by?"
+                                     '((?r "git remote")
+                                       (?s "project slug")))
     (cl-ecase context
-      (?u "/issues")
-      (?g (format "/groups/%s/issues" (magit-read-string-ns "Group ID")))
-      (?e (format "/projects/%s/issues" (url-hexify-string (magit-read-string-ns "Project (owner/repo)"))))
+      (?s (url-hexify-string (magit-read-string-ns "Project (owner/repo)")))
       (?r (cl-multiple-value-bind (_host slug)
               (org-sync-parse-remote (magit-read-string-ns "Remote Url" (magit-get "remote" (magit-read-remote "Remote" nil t) "url")))
-            (format "/projects/%s/issues" (url-hexify-string slug)))))))
+            (url-hexify-string slug))))))
+
+(defun org-sync-gitlab-collect-tags (raw-tags)
+  "Collect tags from RAW-TAGS string."
+  (string-join (mapcar #'org-sync-as-string (org-sync-unserialize raw-tags)) ","))
 
 (defun org-sync-gitlab-issue (data)
   "Given a DATA response from Gitlab issue api return an `org-sync-issue'."
@@ -103,26 +103,50 @@
                    :milestone    .milestone.id
                    :assignee     .assignee.username
                    ;; XXX: Gitlab issues api doesn't send have a "closed_at" field https://gitlab.com/gitlab-org/gitlab-ce/issues/5935
-                   :closed-at    (and (string= .state "closed") .updated_at)
-                   :created-at   .created_at
-                   :created-by   .author.username
-                   :updated-at   .updated_at
+                   :closed_at    (and (string= .state "closed") .updated_at)
+                   :created_at   .created_at
+                   :created_by   .author.username
+                   :updated_at   .updated_at
                    :description  .description
                    :subscribed   (org-sync-json-truthy .subscribed)
                    :confidential (org-sync-json-truthy .confidential))))
 
-(cl-defmethod org-sync/issue-new ((_backend (eql gitlab)) data)
-  (let ((endpoint (org-sync-document-keyword "ORG_SYNC_ISSUES")))
-    (org-sync-gitlab-issue (glab-post endpoint nil `((title       . ,(plist-get data :title))
-                                                     (labels      . ,(string-join (plist-get data :tags) ","))
-                                                     (description . ,(plist-get data :description)))))))
+(cl-defmethod org-sync/issue-new ((_backend (eql gitlab)) issue)
+  (let* ((project-id (org-sync-keyword-get-or-set "ORG_SYNC_GITLAB_PROJECT" #'org-sync-gitlab-endpoint-project))
+         (endpoint (format "/projects/%s/issues" project-id)))
+    (org-sync-gitlab-issue (glab-post endpoint nil `((title       . ,(oref issue title))
+                                                     (labels      . ,(string-join (oref issue tags) ","))
+                                                     (description . ,(oref issue description)))))))
+
+(cl-defmethod org-sync/issue ((_backend (eql gitlab)) id)
+  (let ((project-id (org-sync-keyword-get-or-set "ORG_SYNC_GITLAB_PROJECT" #'org-sync-gitlab-endpoint-project)))
+    (org-sync-gitlab-issue (glab-get (format "/projects/%s/issues/%s" project-id id)))))
+
+(cl-defmethod org-sync/issue-sync ((backend (eql gitlab)) local-issue)
+  (let* ((project-id (org-sync-keyword-get-or-set "ORG_SYNC_GITLAB_PROJECT" #'org-sync-gitlab-endpoint-project))
+         (remote-issue (org-sync/issue backend (oref local-issue id)))
+         (is-outdated-p (time-less-p (org-sync-parse-date (oref local-issue updated_at))
+                                     (org-sync-parse-date (oref remote-issue updated_at)))))
+    (if is-outdated-p
+        remote-issue
+      (let ((data (list
+                   :title        (oref local-issue title)
+                   :description  (oref local-issue description)
+                   :confidential (oref local-issue confidential)
+                   :milestone_id (oref local-issue milestone)
+                   :due_date     (oref local-issue deadline)
+                   :updated_at   (oref local-issue updated_at) ;; XXX: necessary?
+                   :labels       (string-join (oref local-issue tags) ","))))
+        (unless (eq (oref local-issue status) (oref remote-issue status))
+          (plist-put data :state_event (cl-ecase (oref local-issue status)
+                                         (done "close")
+                                         (todo "reopen"))))
+        (org-sync-gitlab-issue (glab-put (format "/projects/%s/issues/%s" project-id (oref local-issue id)) nil data))))))
 
 (cl-defmethod org-sync/issues ((_backend (eql gitlab)))
-  (let ((endpoint (or (org-sync-document-keyword "ORG_SYNC_ISSUES")
-                      (org-sync-returning-it (org-sync-gitlab-read-endpoint)
-                        (org-sync-document-keyword-insert "ORG_SYNC_ISSUES" it))))
+  (let ((project-id (org-sync-keyword-get-or-set "ORG_SYNC_GITLAB_PROJECT" #'org-sync-gitlab-endpoint-project))
         (glab-unpaginate org-sync-gitlab-unpaginate))
-    (mapcar #'org-sync-gitlab-issue (glab-get endpoint org-sync-gitlab-issues-params))))
+    (mapcar #'org-sync-gitlab-issue (glab-get (format "/projects/%s/issues" project-id) org-sync-gitlab-issues-params))))
 
 ;;;###autoload
 (with-eval-after-load 'org-sync

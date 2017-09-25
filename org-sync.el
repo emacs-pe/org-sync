@@ -27,6 +27,8 @@
 
 ;;; Commentary:
 
+;; Synchronize issues with org mode
+
 ;;; Code:
 (eval-when-compile
   (require 'cl-lib)
@@ -54,14 +56,6 @@
   :type  'list
   :group 'org-sync)
 
-(defcustom org-sync-metadata-title-format "Orgsync %b"
-  "Format metadata heading.
-
-%b: backend name"
-  :type 'string
-  :safe #'stringp
-  :group 'org-sync)
-
 (defcustom org-sync-issue-title-format "Bug #%i: %t"
   "Format string for tagged slots.
 The following format codes are supported:
@@ -85,7 +79,7 @@ The following format codes are supported:
   :group 'org-sync)
 
 (defcustom org-sync-headline-level 1
-  "Default org headline level.."
+  "Default org headline level."
   :type 'integer
   :safe #'integerp
   :group 'org-sync)
@@ -94,6 +88,12 @@ The following format codes are supported:
   "Prefix used in org properties to hold the metadata."
   :type 'string
   :safe #'stringp
+  :group 'org-sync)
+
+(defcustom org-sync-read-only nil
+  "Whether to just download the issues and don't sync up."
+  :type 'boolean
+  :safe #'booleanp
   :group 'org-sync)
 
 (defcustom org-sync-process-commented-entries nil
@@ -118,15 +118,9 @@ This directory is relative to git dir.")
 (defvar org-sync-issues-hook '(delete-trailing-whitespace)
   "Hook executed after fetching issues.")
 
-;; TODO(marsam): Replace with a minor-mode(?)
-(defvar-local org-sync nil
-  "Local variable to check if a buffer is synced with")
-(put 'org-sync 'permanent-local t)
-;;;###autoload
-(put 'org-sync 'safe-local-variable 'booleanp)
-
-(defconst org-sync-version "0.1"
-  "Org-sync version.")
+(defvar org-sync-change-hooks '(org-after-tags-change-hook
+                                org-after-todo-state-change-hook)
+  "List of hooks which update the issue information of an entry.")
 
 ;;; Helpers
 (defsubst org-sync-as-symbol (string-or-symbol)
@@ -353,6 +347,16 @@ GRANULARITY and VISIBLE-ONLY arguments are passed to `org-element-parse-buffer'.
     (org-narrow-to-subtree)
     (cl-caddr (org-element-parse-buffer granularity visible-only))))
 
+(defun org-sync-keyword-get-or-set (keyword default)
+  "Fetch a given KEYWORD from the org document.
+
+If the KEYWORD does not exist in the document, add the keyword
+and set it to the DEFAULT value.  The DEFAULT value can also be
+any callable."
+  (or (org-sync-document-keyword keyword)
+      (prog1 (setq default (if (functionp default) (funcall default) default))
+        (org-sync-document-keyword-insert keyword default))))
+
 (defun org-sync-collect-metadata (element)
   "Collect org-sync metadata from an org ELEMENT into a plist.
 
@@ -360,9 +364,23 @@ A metadata is represented in the ELEMENT property drawer prefixed
 by `org-sync-metadata-prefix'."
   (cl-loop for prop in (cddr (assq 'property-drawer (assq 'section element)))
            for plist = (cadr prop)
-           when (string-prefix-p org-sync-metadata-prefix (plist-get plist :key))
-           nconc (list (org-sync-as-keyword (downcase (string-remove-prefix org-sync-metadata-prefix (plist-get plist :key))))
-                       (org-sync-unserialize (plist-get plist :value)))))
+           when (and (string-prefix-p org-sync-metadata-prefix (plist-get plist :key))
+                     (not (string-empty-p (plist-get plist :value))))
+           collect (cons (org-sync-as-symbol (downcase (string-remove-prefix org-sync-metadata-prefix (plist-get plist :key))))
+                         (plist-get plist :value))))
+
+(defun org-sync-element->issue (backend element)
+  "Generate and `org-sync-issue' from a BACKEND an org ELEMENT."
+  (let ((issue (make-instance (org-sync-as-symbol (format "org-sync-issue-%s" backend)))))
+    ;; NB: Update which are in the property drawer
+    (pcase-dolist (`(,name . ,value) (org-sync-collect-metadata element))
+      (setf (eieio-oref issue name) value))
+    (setf (oref issue title) (org-sync-issue-title (car (org-element-property :title element))))
+    (setf (oref issue tags) (mapcar #'org-no-properties (org-element-property :tags element)))
+    (setf (oref issue status) (org-element-property :todo-type element))
+    (setf (oref issue deadline) (org-sync-remove-angle-brackets (org-element-property :raw-value (org-element-property :scheduled element))))
+    (setf (oref issue closed_at) (org-sync-remove-square-brackets (org-element-property :raw-value (org-element-property :closed element))))
+    issue))
 
 (defun org-sync-data-new-issue (element)
   "Return metadata plist from an ELEMENT to create a new issue."
@@ -396,20 +414,27 @@ by `org-sync-metadata-prefix'."
 
 (defun org-sync-issue-title (string)
   "Return the title value from a STRING based on `org-sync-issue-title-format'."
-  (and (string-match (org-sync-issue-title-regexp) string) (match-string 1 string)))
+  (if (string-match (org-sync-issue-title-regexp) string) (match-string 1 string) string))
 
 (defun org-sync-interpret-description (element)
   "Interpret data from description ELEMENT."
-  (org-export-string-as (org-element-interpret-data element) org-sync-export-backend))
+  (if (assq 'fixed-width element)
+      (org-element-property :value (assq 'fixed-width element))
+    (org-export-string-as (org-element-interpret-data element) org-sync-export-backend)))
 
 (defun org-sync-desc-element (element)
   "Return a valid description element for a headline ELEMENT."
   (cl-remove-if (lambda (e) (memq (org-element-type e) '(planning property-drawer))) (assq 'section element)))
 
-(defun org-sync-metadata-valid-p (metadata)
-  "Check if an issue METADATA is valid."
-  (plist-member metadata :id))
+(defun org-sync-change-function ()
+  "Trigger the org-sync update of the current entry."
+  (and (org-entry-get nil "OS_UPDATED_AT")
+       (org-entry-put nil "OS_UPDATED_AT" (format-time-string "%FT%T%z"))))
 
+;; NB: We use underscore "_" instead of dash "-" for the slots naming (even
+;;     though is against the "Lisp Naming conventions"), because we convert them
+;;     to `org-mode' properties, and org mode doesn't get along with dashed
+;;     properties.
 (defclass org-sync-issue ()
   ((id           :initarg :id           :initform nil) ; String (required)
    (url          :initarg :url          :initform nil) ; String
@@ -419,17 +444,14 @@ by `org-sync-metadata-prefix'."
    (comments     :initarg :comments     :initform nil) ; Integer
    (deadline     :initarg :deadline     :initform nil) ; DateString
    (milestone    :initarg :milestone    :initform nil) ; nil | String
-   (created-at   :initarg :created-at   :initform nil) ; DateString
-   (created-by   :initarg :created-by   :initform nil) ; nil | String
-   (closed-at    :initarg :closed-at    :initform nil) ; nil | DateString
-   (closed-by    :initarg :closed-by    :initform nil) ; nil | String
-   (updated-at   :initarg :updated-at   :initform nil) ; DateString
+   (created_at   :initarg :created_at   :initform nil) ; DateString
+   (created_by   :initarg :created_by   :initform nil) ; nil | String
+   (closed_at    :initarg :closed_at    :initform nil) ; nil | DateString
+   (closed_by    :initarg :closed_by    :initform nil) ; nil | String
+   (updated_at   :initarg :updated_at   :initform nil) ; DateString
    (description  :initarg :description  :initform nil) ; String
    )
   :abstract t)
-
-(cl-defgeneric org-sync/metadata (backend)
-  (:documentation "Metadata to identify a backend"))
 
 (cl-defgeneric org-sync/valid-p (backend metadata)
   (:documentation "Check if backend is correctly configured with metadata"))
@@ -437,18 +459,14 @@ by `org-sync-metadata-prefix'."
 (cl-defgeneric org-sync/issues (backend)
   (:documentation "Get all issues from backend"))
 
-(cl-defgeneric org-sync/issue-new (backend metadata issue-data)
+(cl-defgeneric org-sync/issue (backend id)
+  (:documentation "Fetch an issue in backend from an `org-sync-issue'"))
+
+(cl-defgeneric org-sync/issue-new (backend issue)
   (:documentation "Create an issue in backend from an `org-sync-issue'"))
 
-(cl-defgeneric org-sync/issue-get (backend &rest args)
-  (:documentation "Get an `org-sync-issue' from backend and id"))
-
-(cl-defgeneric org-sync/issue-update (backend &rest args)
+(cl-defgeneric org-sync/issue-sync (backend issue)
   (:documentation "Update an `org-sync-issue' from backend and id"))
-
-(cl-defgeneric org-sync/issue-delete (backend &rest args)
-  (:documentation "Import an `org-sync-issue' from backend and id"))
-
 
 (cl-defmethod org-sync/issue->org-title ((issue org-sync-issue))
   (format-spec org-sync-issue-title-format `((?i . ,(oref issue id))
@@ -465,22 +483,13 @@ by `org-sync-metadata-prefix'."
 
 (cl-defmethod org-sync/issue->org-planning ((issue org-sync-issue))
   (nconc (and (oref issue deadline) `(:deadline (timestamp (:raw-value ,(org-sync-date-to-timestamp (oref issue deadline) 'with-hm)))))
-         (and (oref issue closed-at) `(:closed (timestamp (:raw-value ,(org-sync-date-to-timestamp (oref issue closed-at) 'with-hm 'inactive)))))))
-
-(cl-defmethod org-sync/metadata->org-element (backend)
-  "Return a org element from an `org-sync' ISSUE."
-  (org-element-interpret-data `(headline
-                                (:title ,(format-spec org-sync-metadata-title-format `((?b . ,backend)))
-                                        :level ,org-sync-headline-level)
-                                (section
-                                 nil
-                                 (property-drawer (:post-blank 1) ,(org-sync-plist-to-node-properties (org-sync/metadata backend)))))))
+         (and (oref issue closed_at) `(:closed (timestamp (:raw-value ,(org-sync-date-to-timestamp (oref issue closed_at) 'with-hm 'inactive)))))))
 
 (cl-defmethod org-sync/issue->org-element ((issue org-sync-issue))
   "Return a org element from an `org-sync' ISSUE."
   `(headline
     (:title ,(org-sync/issue->org-title issue)
-            :level        ,(1+ org-sync-headline-level)
+            :level        ,org-sync-headline-level
             :tags         ,(org-sync/issue->org-tag issue)
             :todo-type    ,(oref issue status)
             :todo-keyword ,(org-sync/issue->org-keyword issue))
@@ -496,6 +505,19 @@ by `org-sync-metadata-prefix'."
 
 
 ;;; Public
+;;;###autoload
+(define-minor-mode org-sync-mode
+  "Org sync minor mode.
+
+\\{org-sync-mode-map}"
+  :init-value nil
+  :group 'org-sync
+  (if org-sync-mode
+      (dolist (hook org-sync-change-hooks)
+        (add-hook hook 'org-sync-change-function))
+    (dolist (hook org-sync-change-hooks)
+      (remove-hook hook 'org-sync-change-hooks))))
+
 ;;;###autoload
 (defun org-sync (&optional arg)
   "Sync the state from an item.
@@ -514,27 +536,23 @@ determine the new state."
     (if (equal arg '(16)) (setq arg 'nextset))
     (if (and (org-in-commented-heading-p t) (not org-sync-process-commented-entries))
         (message "Not syncing commented entry")
-      (save-excursion
-        (when-let (backend (org-sync-as-symbol (org-sync-backend)))
-          (cl-assert (org-sync-registered-backend-p backend) nil "Unregistered org-sync backend: %S" backend)
-          (let* ((class (org-sync-as-symbol (format "org-sync-issue-%s" backend)))
-                 (element (org-sync-parse-subtree))
-                 (metadata (org-sync-collect-metadata element))
-                 (desc-element (org-sync-desc-element element))
-                 (begin (org-element-property :begin element))
-                 (end (or (org-element-property :end desc-element)
-                          (org-element-property :end element))))
-            (if (org-sync-metadata-valid-p metadata)
-                (let ((issue (apply class metadata)))
-                  (setf (oref issue title) (car (org-element-property :title element)))
-                  (delete-region begin end)
-                  (insert (org-sync/issue->org issue)))
-              ;; XXX: Issue doesn't exists create it
-              (let* ((metadata (org-sync/metadata backend))
-                     (issue-data (plist-put (org-sync-data-new-issue element) :description (org-sync-interpret-description desc-element)))
-                     (issue (org-sync/issue-new backend metadata issue-data)))
-                (delete-region begin end)
-                (insert (org-sync/issue->org issue))))))))))
+      (let* ((backend (org-sync-backend))
+             (element (org-sync-parse-subtree))
+             (issue (org-sync-element->issue backend element))
+             (desc-element (org-sync-desc-element element))
+             (begin (org-element-property :begin element))
+             (end (or (org-element-property :end desc-element)
+                      (org-element-property :end element)))
+             (org-sync-headline-level (plist-get (cadr element) :level)))
+        (setf (oref issue description) (org-sync-interpret-description desc-element))
+        (with-demoted-errors "Error while syncing entry: %S"
+          (atomic-change-group
+            (delete-region begin end)
+            (insert (org-sync/issue->org (if (oref issue id)
+                                             (if org-sync-read-only
+                                                 (org-sync/issue backend (oref issue id))
+                                               (org-sync/issue-sync backend issue))
+                                           (org-sync/issue-new backend issue))))))))))
 
 ;;;###autoload
 (cl-defun org-sync-issues ()
@@ -542,10 +560,9 @@ determine the new state."
   (interactive)
   (dolist (issue (org-sync/issues (org-sync-backend)))
     (if-let (pom (org-sync-find-entry-with-id (oref issue id)))
-        (with-demoted-errors "Error while syncing issue: %S"
-          (org-with-point-at pom
-            (message "Syncing issue %s..." (oref issue id))
-            (call-interactively #'org-sync)))
+        (org-with-point-at pom
+          (message "Syncing issue %s..." (oref issue id))
+          (call-interactively #'org-sync))
       (org-with-point-at (point-max)
         (insert (org-sync/issue->org issue)))))
   (run-hooks 'org-sync-issues-hook))

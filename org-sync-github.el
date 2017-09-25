@@ -3,7 +3,7 @@
 ;; Copyright (c) 2015 Mario Rodas <marsam@users.noreply.github.com>
 
 ;; Author: Mario Rodas <marsam@users.noreply.github.com>
-;; URL:
+;; URL: https://github.com/emacs-pe/org-sync
 ;; Keywords: convenience
 ;; Version: 0.1
 ;; Package-Requires: ((emacs "25.1") (ghub "1.2"))
@@ -64,21 +64,17 @@
   ((locked     :initarg :locked     :initform nil)
    (assignees  :initarg :assignees  :initform nil)))
 
-(defun org-sync-github-read-endpoint ()
+(defun org-sync-github-endpoint-project ()
   "Read an endpoint to be used to fetch the issues."
   (cl-multiple-value-bind (context _name)
       (org-sync-read-multiple-choice "GitHub Issues by?"
-                                     '((?u "user issues")
-                                       (?o "organization issues")
-                                       (?e "enter project")
-                                       (?r "git remote")))
+                                     '((?r "git remote")
+                                       (?s "project slug")))
     (cl-ecase context
-      (?u "/issues")
-      (?o (format "/orgs/%s/issues" (magit-read-string-ns "Organization")))
-      (?e (format "/repos/%s/issues" (magit-read-string-ns "Project (owner/repo)")))
+      (?s (magit-read-string-ns "Project (owner/repo)"))
       (?r (cl-multiple-value-bind (_host slug)
               (org-sync-parse-remote (magit-read-string-ns "Remote Url" (magit-get "remote" (magit-read-remote "Remote" nil t) "url")))
-            (format "/repos/%s/issues" slug))))))
+            slug)))))
 
 (defun org-sync-github-issue (data)
   "Given a DATA response from GitHub issue api return an `org-sync-issue'."
@@ -88,7 +84,7 @@
                    :id          .number
                    :url         .html_url
                    :tags        (mapcar (lambda (label)
-                                          (assoc-default "name" label))
+                                          (assoc-default 'name label))
                                         .labels)
                    :title       .title
                    :status      (pcase .state
@@ -100,22 +96,43 @@
                    :locked      (org-sync-json-truthy .locked)
                    :milestone   .milestone.number
                    :assignees   (mapcar (lambda (assignee)
-                                          (assoc-default "login" assignee))
+                                          (assoc-default 'login assignee))
                                         .assignees)
-                   :closed-at   .closed_at
-                   :closed-by   .closed_by.login
-                   :created-at  .created_at
-                   :created-by  .user.login
-                   :updated-at  .updated_at
+                   :closed_at   .closed_at
+                   :closed_by   .closed_by.login
+                   :created_at  .created_at
+                   :created_by  .user.login
+                   :updated_at  .updated_at
                    :description .body)))
 
+(cl-defmethod org-sync/issue-new ((_backend (eql github)) issue)
+  (let ((slug (org-sync-keyword-get-or-set "ORG_SYNC_GITHUB_SLUG" #'org-sync-github-endpoint-project)))
+    (org-sync-github-issue (ghub-post (format "/repos/%s/issues" slug) nil (list
+                                                                            :title     (oref issue title)
+                                                                            :labels    (oref issue tags)
+                                                                            :body      (oref issue description)
+                                                                            :assignees (oref issue assignees))))))
+
+(cl-defmethod org-sync/issue ((backend (eql github)) local-issue)
+  (let* ((slug (org-sync-keyword-get-or-set "ORG_SYNC_GITHUB_SLUG" #'org-sync-github-endpoint-project))
+         (remote-issue (org-sync/issue backend (oref local-issue id)))
+         (is-outdated-p (time-less-p (org-sync-parse-date (oref local-issue updated_at))
+                                     (org-sync-parse-date (oref remote-issue updated_at)))))
+    (if is-outdated-p
+        remote-issue
+      (let ((data (list
+                   :title        (oref local-issue title)
+                   :body         (oref local-issue description)
+                   :assignees    (oref local-issue assignees)
+                   :milestone_id (oref local-issue milestone)
+                   :state        (oref local-issue status)
+                   :labels       (oref local-issue tags))))
+        (org-sync-github-issue (ghub-patch (format "/repos/%s/issues/%s" slug (oref local-issue id)) nil data))))))
+
 (cl-defmethod org-sync/issues ((_backend (eql github)))
-  "Get issues from GitHub backend."
-  (let ((endpoint (or (org-sync-document-keyword "ORG_SYNC_ISSUES")
-                      (org-sync-returning-it (org-sync-github-read-endpoint)
-                        (org-sync-document-keyword-insert "ORG_SYNC_ISSUES" it))))
+  (let ((slug (org-sync-keyword-get-or-set "ORG_SYNC_GITHUB_SLUG" #'org-sync-github-endpoint-project))
         (ghub-unpaginate org-sync-github-unpaginate))
-    (mapcar #'org-sync-github-issue (ghub-get endpoint org-sync-github-issues-params))))
+    (mapcar #'org-sync-github-issue (ghub-get (format "/repos/%s/issues" slug) org-sync-github-issues-params))))
 
 ;;;###autoload
 (with-eval-after-load 'org-sync
